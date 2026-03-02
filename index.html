@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="ja">
 <head>
@@ -150,7 +151,8 @@
       if (msg.type === 'ready') {
         workerReady = true;
         document.getElementById('bootMsg').innerText = "✅ デコーダー準備OK";
-        return;
+console.log('=== ZXingReader --help ===', msg.helpOutput); // ★        
+return;
       }
       if (msg.type === 'resp') {
         const p = pending.get(msg.id);
