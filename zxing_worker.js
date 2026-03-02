@@ -1,62 +1,35 @@
+/**
+ * zxing_worker.js - 正しい実装
+ * ZXingReader.js = Emscriptenビルドのコマンドラインバイナリ
+ * Module.print でstdoutをキャプチャし、Module.callMain(args) で実行する
+ */
+
 let ready = false;
-let zxingEngine = null;
 
-// ▼ Workerの初期化を非同期（async）で行うように全体を包む
-(async function initWorker() {
-  try {
-    // 1. ファイルを読み込む
-    importScripts('./ZXingReader.js');
-
-    // 2. エンジンの「素（ファクトリー関数、またはオブジェクト）」を探す
-    let moduleOrFactory = self.ZXingReader || self.ZXingWASM || self.ZXing || self.zxing || self.Module;
-
-    // もし一般的な名前で見つからなければ、自力で探す
-    if (!moduleOrFactory) {
-      for (const key in self) {
-        // ZXingっぽい名前の関数を探す
-        if (typeof self[key] === 'function' && key.toLowerCase().includes('zxing')) {
-          moduleOrFactory = self[key];
-          break;
-        }
-      }
-    }
-
-    if (!moduleOrFactory) {
-      throw new Error('ZXingReader.js の中にエンジン本体が見つかりません。');
-    }
-
-    // 3. ★超重要：もし「起動スイッチ（関数）」だった場合、実行してWASMのロード完了を待つ
-    if (typeof moduleOrFactory === 'function') {
-      // WASMファイルの読み込みと準備が終わるまで待機
-      zxingEngine = await moduleOrFactory(); 
-    } else {
-      // すでにオブジェクトとして完成している場合はそのまま使う
-      zxingEngine = moduleOrFactory;
-    }
-
-    // 4. 解析用のメソッド（命令）が存在するか最終確認
-    if (!zxingEngine || typeof zxingEngine.readBarcodesFromImageData !== 'function') {
-      // バージョン違いでメソッド名が単数形になっている場合の救済措置
-      if (zxingEngine && typeof zxingEngine.readBarcodeFromImageData === 'function') {
-        zxingEngine.readBarcodesFromImageData = zxingEngine.readBarcodeFromImageData;
-      } else {
-        throw new Error('QR解析用のメソッド(readBarcodesFromImageData)が見つかりません。WASMのビルド仕様が異なる可能性があります。');
-      }
-    }
-
-    // 全ての準備が完了
+// ★ importScripts より先に Module を定義すること（必須）
+self.Module = {
+  noInitialRun: true,          // 自動実行を抑止
+  print(text) {
+    self._stdout = (self._stdout || '') + text + '\n';
+  },
+  printErr(text) { /* stderr 無視 */ },
+  onRuntimeInitialized() {
     ready = true;
     self.postMessage({ type: 'ready' });
+  },
+  onAbort(what) {
+    self.postMessage({ type: 'fatal', error: 'WASM abort: ' + what });
+  },
+};
 
-  } catch (e) {
-    self.postMessage({ type: 'fatal', error: (e && e.message) ? e.message : String(e) });
-  }
-})();
+try {
+  importScripts('./ZXingReader.js');
+} catch (e) {
+  self.postMessage({ type: 'fatal', error: 'importScripts 失敗: ' + (e.message || String(e)) });
+}
 
-// ▼ メイン画面（index.html）から画像データが送られてきたときの処理
 self.onmessage = async (ev) => {
-  if (!ready || !zxingEngine) return;
-
+  if (!ready) return;
   const msg = ev.data || {};
   if (msg.type !== 'req') return;
 
@@ -64,50 +37,130 @@ self.onmessage = async (ev) => {
   const t0 = performance.now();
 
   try {
-    const width = msg.width | 0;
+    const width  = msg.width  | 0;
     const height = msg.height | 0;
-    const buf = msg.data;
+    const buf    = msg.data;
 
     if (!(buf instanceof ArrayBuffer)) throw new Error('data is not ArrayBuffer');
 
-    const u8 = new Uint8ClampedArray(buf);
-    const img = new ImageData(u8, width, height);
+    const FS = self.Module.FS;
+    if (!FS) throw new Error('Module.FS が見つかりません');
 
-    const opts = msg.options || { formats: ["QRCode"], tryHarder: true, tryRotate: true, tryInvert: true };
+    // RGBA → PNG に変換して MEMFS に書き込む
+    const inputPath = '/tmp/input_qr.png';
+    const pngBytes  = await rgbaToPng(new Uint8ClampedArray(buf), width, height);
+    FS.writeFile(inputPath, pngBytes);
 
-    // 解析の実行
-    const results = await zxingEngine.readBarcodesFromImageData(img, opts);
+    // stdout リセット → callMain 実行
+    self._stdout = '';
+    const opts   = msg.options || {};
+    const format = (opts.formats && opts.formats[0]) || 'QRCode';
 
+    try {
+      self.Module.callMain(['--format', format, '--input', inputPath]);
+    } catch (_) {
+      // callMain は exit() で例外を投げることがある（正常動作）
+    }
+
+    const rawOutput = self._stdout || '';
+    try { FS.unlink(inputPath); } catch (_) {}
+
+    const results = parseOutput(rawOutput);
     const t1 = performance.now();
-    const found = Array.isArray(results) && results.length > 0;
-
-    // Getterで隠れたプロパティ（management16など）を明示的に抽出して表のHTMLに送る
-    const packed = (results || []).map(r => ({
-      ...r,
-      text: r.text,
-      format: r.format,
-      position: r.position,
-      management16: r.management16, // ★必須データ
-      extra: r.extra,
-      extras: r.extras,
-      metadata: r.metadata,
-      bytes: r.bytes ? Array.from(r.bytes) : null,
-    }));
 
     self.postMessage({
-      type: 'resp',
-      id,
-      ok: true,
-      payload: { found, results: packed, ms: (t1 - t0) }
+      type: 'resp', id, ok: true,
+      payload: { found: results.length > 0, results, ms: t1 - t0, rawOutput },
     });
+
   } catch (e) {
-    const t1 = performance.now();
     self.postMessage({
-      type: 'resp',
-      id,
-      ok: false,
-      error: (e && e.message) ? e.message : String(e),
-      payload: { ms: (t1 - t0) }
+      type: 'resp', id, ok: false,
+      error: e.message || String(e),
+      payload: { ms: performance.now() - t0 },
     });
   }
 };
+
+// stdout テキスト → 結果オブジェクト配列
+function parseOutput(text) {
+  if (!text || !text.trim()) return [];
+  const results = [];
+  let cur = null;
+  for (const line of text.split('\n')) {
+    const m1 = line.match(/^Text:\s*"?(.+?)"?\s*$/);
+    const m2 = line.match(/^(?:Format|Symbology):\s*(.+?)\s*$/);
+    const m3 = line.match(/^[-=]{4,}/);
+    if (m1) { if (!cur) cur = {}; cur.text = m1[1]; }
+    else if (m2) { if (!cur) cur = {}; cur.format = m2[1]; }
+    else if (m3 && cur) { results.push(cur); cur = null; }
+  }
+  if (cur && cur.text) results.push(cur);
+  if (!results.length && text.trim())
+    results.push({ format: 'Unknown', text: text.trim() });
+  return results;
+}
+
+// RGBA → PNG（OffscreenCanvas を使用、フォールバックあり）
+async function rgbaToPng(rgba, width, height) {
+  if (typeof OffscreenCanvas !== 'undefined') {
+    const canvas = new OffscreenCanvas(width, height);
+    canvas.getContext('2d').putImageData(new ImageData(rgba, width, height), 0, 0);
+    const blob = await canvas.convertToBlob({ type: 'image/png' });
+    return new Uint8Array(await blob.arrayBuffer());
+  }
+  return buildMinimalPng(rgba, width, height);
+}
+
+// 最小 PNG エンコーダ（フォールバック）
+function buildMinimalPng(rgba, width, height) {
+  const ct = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+    ct[i] = c;
+  }
+  const crc32   = b => { let c = 0xffffffff; for (const x of b) c = ct[(c^x)&0xff]^(c>>>8); return (c^0xffffffff)>>>0; };
+  const adler32 = b => { let s1=1,s2=0; for(const x of b){s1=(s1+x)%65521;s2=(s2+s1)%65521;} return(s2<<16)|s1; };
+
+  const ihdr = new Uint8Array(13);
+  const dv   = new DataView(ihdr.buffer);
+  dv.setUint32(0, width); dv.setUint32(4, height);
+  ihdr[8] = 8; ihdr[9] = 2; // 8bit RGB
+
+  const raw = new Uint8Array(height * (1 + width * 3));
+  for (let y = 0; y < height; y++) {
+    raw[y * (1 + width * 3)] = 0;
+    for (let x = 0; x < width; x++) {
+      const s = (y*width+x)*4, d = y*(1+width*3)+1+x*3;
+      raw[d]=rgba[s]; raw[d+1]=rgba[s+1]; raw[d+2]=rgba[s+2];
+    }
+  }
+
+  const M=65535, B=Math.ceil(raw.length/M);
+  const df=new Uint8Array(2+raw.length+B*5+4); let p=0;
+  df[p++]=0x78; df[p++]=0x01;
+  for (let i=0;i<B;i++) {
+    const s=i*M, e=Math.min(s+M,raw.length), l=e-s;
+    df[p++]=i===B-1?1:0; df[p++]=l&0xff; df[p++]=(l>>8)&0xff; df[p++]=~l&0xff; df[p++]=(~l>>8)&0xff;
+    df.set(raw.subarray(s,e),p); p+=l;
+  }
+  const a = adler32(raw);
+  df[p++]=(a>>24)&0xff; df[p++]=(a>>16)&0xff; df[p++]=(a>>8)&0xff; df[p++]=a&0xff;
+  const deflate = df.subarray(0, p);
+
+  const chunk = (t, d) => {
+    const tb=new TextEncoder().encode(t), cb=new Uint8Array(tb.length+d.length);
+    cb.set(tb); cb.set(d,tb.length);
+    const lb=new Uint8Array(4), rb=new Uint8Array(4);
+    new DataView(lb.buffer).setUint32(0,d.length);
+    new DataView(rb.buffer).setUint32(0,crc32(cb));
+    return [lb, tb, d, rb];
+  };
+
+  const sig   = new Uint8Array([137,80,78,71,13,10,26,10]);
+  const parts = [sig, ...chunk('IHDR',ihdr), ...chunk('IDAT',deflate), ...chunk('IEND',new Uint8Array(0))];
+  const out   = new Uint8Array(parts.reduce((s,p)=>s+p.length,0));
+  let off = 0; for (const p of parts) { out.set(p,off); off+=p.length; }
+  return out;
+}
