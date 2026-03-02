@@ -1,22 +1,26 @@
-/* zxing_worker.js (classic Worker)
- *
- * 同一ディレクトリに以下がある前提：
- * - index.js
- * - zxing_reader.wasm
- * - zxing_worker.js（このファイル）
- *
- * index.js は zxing-wasm（IIFE reader）で、読み込み後 `ZXingWASM` を提供する想定。
- */
-
 let ready = false;
+let zxingEngine = null;
 
 try {
-  // ローカルの IIFE 本体をロード
+  // ▼ 1. ご指定の「ZXingReader.js」を読み込む
   importScripts('./ZXingReader.js');
 
-  // ここでZXingWASMが生えている想定
-  if (!self.ZXingWASM || typeof self.ZXingWASM.readBarcodesFromImageData !== 'function') {
-    throw new Error('ZXingWASM が見つかりません（index.js が reader IIFE か確認してください）');
+  // ▼ 2. ライブラリが作ったエンジンの名前を自動で探す
+  zxingEngine = self.zxing || self.ZXing || self.ZXingWASM || self.ZXingReader;
+
+  // ▼ 3. もし見つからなければ、関数の中身を総当たりで探す
+  if (!zxingEngine || typeof zxingEngine.readBarcodesFromImageData !== 'function') {
+    for (const key in self) {
+      if (self[key] && typeof self[key].readBarcodesFromImageData === 'function') {
+        zxingEngine = self[key];
+        break;
+      }
+    }
+  }
+
+  // それでもダメならエラーを出す
+  if (!zxingEngine) {
+    throw new Error('QR解析用のエンジンが見つかりません。ZXingReader.jsの中身を確認してください。');
   }
 
   ready = true;
@@ -26,14 +30,14 @@ try {
 }
 
 self.onmessage = async (ev) => {
-  if (!ready) return;
+  if (!ready || !zxingEngine) return;
 
   const msg = ev.data || {};
   if (msg.type !== 'req') return;
 
   const id = msg.id;
-
   const t0 = performance.now();
+
   try {
     const width = msg.width | 0;
     const height = msg.height | 0;
@@ -46,23 +50,23 @@ self.onmessage = async (ev) => {
 
     const opts = msg.options || { formats: ["QRCode"], tryHarder: true, tryRotate: true, tryInvert: true };
 
-    const results = await self.ZXingWASM.readBarcodesFromImageData(img, opts);
+    // ▼ 自動検出したエンジンで解析を実行
+    const results = await zxingEngine.readBarcodesFromImageData(img, opts);
 
     const t1 = performance.now();
     const found = Array.isArray(results) && results.length > 0;
 
-    // ★修正箇所：WASMのGetterプロパティが欠落しないよう、明示的に書き出してコピーする
+    // ▼ Getterで隠れたプロパティ（management16など）を明示的に抽出して表のHTMLに送る
     const packed = (results || []).map(r => ({
-      ...r, // 列挙可能なプロパティはそのまま
+      ...r,
       text: r.text,
       format: r.format,
       position: r.position,
-      // 独自WASMの出力に対応するため、考えられるプロパティを明示的に指定
-      management16: r.management16, 
+      management16: r.management16, // ★ここが超重要
       extra: r.extra,
       extras: r.extras,
       metadata: r.metadata,
-      bytes: r.bytes ? Array.from(r.bytes) : null, // ArrayBufferはそのまま送れないので配列化
+      bytes: r.bytes ? Array.from(r.bytes) : null,
     }));
 
     self.postMessage({
