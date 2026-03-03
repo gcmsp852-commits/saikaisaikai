@@ -4,7 +4,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-  <title>QRツイン リーダー（WASM/Worker版）</title>
+  <title>QRツイン リーダー（JavaScript/Worker版）</title>
 
   <meta name="apple-mobile-web-app-title" content="QRツイン">
   <meta name="application-name" content="QRツイン">
@@ -66,12 +66,12 @@
 </head>
 
 <body>
-  <h2>📱 QRツイン リーダー（WASM/Worker）</h2>
+  <h2>📱 QRツイン リーダー（JavaScript/Worker）</h2>
 
   <div id="startScreen">
     <p class="small">
       単体QRとして1個目を確実に取得 → その距離関係で2個目を探索します。<br>
-      エンジン: zxing-wasm（ZXing-cpp WASM）+ Worker
+      エンジン: JavaScript BarcodeDetector + Worker
     </p>
     <button id="startBtn" onclick="startApp()">📷 カメラを起動する</button>
     <div class="small" id="bootMsg"></div>
@@ -84,7 +84,7 @@
 
   <div class="status-panel" id="statusPanel">
     <div class="small">
-      🐢 エンジン: WASM（単体強化 → 距離探索） / Workerで重い処理を分離
+      🐢 エンジン: JavaScript（BarcodeDetector） / Workerで重い処理を分離
     </div>
 
     <div class="qr-result qr-1">
@@ -133,7 +133,7 @@
   const workCtx = workCanvas.getContext('2d', { willReadFrequently: true });
 
   // ==========
-  // Worker (zxing-wasm)
+  // Worker (JavaScript QR decoder)
   // ==========
   let worker = null;
   let workerReady = false;
@@ -151,8 +151,7 @@
       if (msg.type === 'ready') {
         workerReady = true;
         document.getElementById('bootMsg').innerText = "✅ デコーダー準備OK";
-console.log('=== ZXingReader --help ===', msg.helpOutput); // ★        
-return;
+        return;
       }
       if (msg.type === 'resp') {
         const p = pending.get(msg.id);
@@ -803,7 +802,7 @@ return;
       const t0 = Date.now();
       while (!workerReady) {
         if (Date.now() - t0 > 3000) {
-          throw new Error("デコーダー初期化がタイムアウトしました（zxing_worker.js / wasm の配置とパスを確認）");
+          throw new Error("デコーダー初期化がタイムアウトしました（zxing_worker.js の配置とブラウザ対応を確認）");
         }
         await new Promise(r => setTimeout(r, 50));
       }
